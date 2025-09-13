@@ -32,7 +32,11 @@ def get_secrets():
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     s = get_secrets()
-    eng = create_engine(s["SUPABASE_DB_URL"], pool_pre_ping=True)
+    url = s["SUPABASE_DB_URL"]
+    # Auto-swap psycopg2 -> psycopg (psycopg3) for Py3.13 compatibility on Streamlit Cloud
+    if "+psycopg2" in url:
+        url = url.replace("+psycopg2", "+psycopg")
+    eng = create_engine(url, pool_pre_ping=True)
     return eng
 
 @st.cache_resource(show_spinner=False)
