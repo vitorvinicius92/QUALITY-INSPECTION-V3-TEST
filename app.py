@@ -6,15 +6,11 @@ import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-st.set_page_config(page_title="RNC - Supabase (Safe Boot)", page_icon="🧰", layout="wide")
+st.set_page_config(page_title="RNC - Supabase (Safe Boot / psycopg3)", page_icon="🧰", layout="wide")
 
-# ------------------------------------------------------------------
-# Lê Secrets (SUPABASE_DB_URL, QUALITY_PASS). Não conecta automaticamente.
-# ------------------------------------------------------------------
 DB_URL_RAW = os.getenv("SUPABASE_DB_URL", "")
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
 
-# Estado da sessão
 if "connected" not in st.session_state:
     st.session_state.connected = False
 if "db_url_fixed" not in st.session_state:
@@ -41,10 +37,12 @@ def redact(u: str) -> str:
     except Exception:
         return u
 
-def force_pg8000_scheme(p):
-    return "postgresql+pg8000"
+def force_psycopg_scheme(p):
+    # sempre usa o driver psycopg3
+    return "postgresql+psycopg"
 
-def ensure_sslmode(qs: str) -> str:
+def ensure_ssl_and_timeout(qs: str) -> str:
+    # garante sslmode=require e connect_timeout=8
     if not qs:
         return "sslmode=require&connect_timeout=8"
     parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
@@ -54,18 +52,18 @@ def ensure_sslmode(qs: str) -> str:
         qs += "&connect_timeout=8"
     return qs
 
-def autofix_url(raw: str) -> tuple[str, dict]:
+def autofix_url(raw: str) -> str:
     """
-    - Força driver pg8000
-    - Se host for db.<ref>.supabase.co com porta 6543, troca para pooler e ajusta user para postgres.<ref>
-    - Se host já for pooler, força porta 6543
-    - Garante sslmode=require e connect_timeout=8
+    Força driver psycopg3 e corrige host/porta comuns:
+    - db.<ref>.supabase.co:6543  -> pooler + user postgres.<ref>
+    - pooler host -> porta 6543
+    Adiciona sslmode=require e connect_timeout=8
     """
     if not raw:
         raise RuntimeError("SUPABASE_DB_URL não definido.")
     p = urllib.parse.urlparse(raw)
 
-    scheme = force_pg8000_scheme(p)
+    scheme = force_psycopg_scheme(p)
     if "@" not in p.netloc:
         raise RuntimeError("URL inválida (sem user@host). Use a string SQLAlchemy do Supabase.")
 
@@ -86,23 +84,21 @@ def autofix_url(raw: str) -> tuple[str, dict]:
         if len(parts) >= 3:
             ref = parts[1]
 
-    # Corrige pooler/porta
     if host.endswith(".pooler.supabase.com"):
         port = 6543
     elif ref and port == 6543:
         host = POOLER_HOST_DEFAULT
-        if not userinfo.startswith("postgres."):
-            # preserva senha após os dois pontos
-            if ":" in userinfo:
-                _, password = userinfo.split(":", 1)
-                userinfo = f"postgres.{ref}:{password}"
-            else:
-                userinfo = f"postgres.{ref}"
+        # ajusta user para postgres.<ref> preservando senha
+        if ":" in userinfo:
+            _, password = userinfo.split(":", 1)
+            userinfo = f"postgres.{ref}:{password}"
+        else:
+            userinfo = f"postgres.{ref}"
 
     if host.startswith("db.") and host.endswith(".supabase.co") and (port is None):
         port = 5432
 
-    qs = ensure_sslmode(p.query)
+    qs = ensure_ssl_and_timeout(p.query)
     fixed = urllib.parse.urlunparse((
         scheme,
         f"{userinfo}@{host}:{port or 5432}",
@@ -111,13 +107,13 @@ def autofix_url(raw: str) -> tuple[str, dict]:
         qs,
         p.fragment,
     ))
-    connect_args = {"ssl": True, "timeout": 8}
-    return fixed, connect_args
+    return fixed
 
 def try_connect():
-    url, connect_args = autofix_url(DB_URL_RAW)
+    url = autofix_url(DB_URL_RAW)
     st.session_state.db_url_fixed = url
-    eng = create_engine(url, pool_size=1, max_overflow=0, pool_pre_ping=False, connect_args=connect_args)
+    # psycopg3 aceita ?connect_timeout no DSN, não precisa connect_args extra
+    eng = create_engine(url, pool_size=1, max_overflow=0, pool_pre_ping=False)
     with eng.connect() as conn:
         conn.exec_driver_sql("SELECT 1;")
     st.session_state.engine = eng
@@ -221,7 +217,7 @@ if btn and not st.session_state.connected:
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar", "⬇️⬆️ CSV", "ℹ️ Status"])
 
 if not st.session_state.connected:
-    st.info("Clique em **🔌 Conectar** na barra lateral para iniciar a conexão (timeout curto para não travar).");
+    st.info("Clique em **🔌 Conectar** na barra lateral para iniciar a conexão (timeout curto).");
     st.stop()
 
 if menu == "➕ Nova RNC":
@@ -317,12 +313,7 @@ elif menu == "⬇️⬆️ CSV":
 
 elif menu == "ℹ️ Status":
     st.title("Status")
-    try:
-        import pg8000
-        st.success(f"pg8000 importado: v{pg8000.__version__}")
-    except Exception as e:
-        st.error("pg8000 NÃO está instalado.")
-        st.exception(e)
     st.code("SUPABASE_DB_URL (parcial): " + redact(DB_URL_RAW))
-    st.code("URL usada (parcial): " + redact(st.session_state.db_url_fixed))
-    st.info("Modo Safe Boot: conexão só quando você clicar em 'Conectar', com timeout curto (8s).");
+    built = autofix_url(DB_URL_RAW) if DB_URL_RAW else ""
+    st.code("URL usada (parcial): " + redact(built))
+    st.info("Driver: psycopg3. Modo Safe Boot: conexão só quando clicar em 'Conectar'.");
