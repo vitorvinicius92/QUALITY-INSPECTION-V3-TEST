@@ -1,4 +1,2 @@
-# RNC SQL - Diagnóstico
-
-Suba este pacote sozinho. Ele testa a URL do banco, a conexão e uma escrita simples,
-mostrando qualquer erro diretamente na interface.
+# Pacote Py3.11 estável
+Use estas versões para evitar falha de installer no Streamlit Cloud.
