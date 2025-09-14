@@ -1,0 +1,9 @@
+
+streamlit
+sqlalchemy>=2.0
+psycopg2-binary
+pandas
+pillow
+requests
+reportlab
+supabase
