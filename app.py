@@ -8,25 +8,27 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 # -----------------------------------------------------
-# Config
+# Configuração
 # -----------------------------------------------------
-st.set_page_config(page_title="RNC - SQL (corrigido pyformat)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="RNC - SQL (fix pyformat)", page_icon="🛠️", layout="wide")
 
-DB_URL = os.getenv("SUPABASE_DB_URL", "")  # ex.: postgresql+psycopg2://postgres.<ref>:<senha>@aws-1-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require
+DB_URL = os.getenv("SUPABASE_DB_URL", "")  # exemplo: postgresql+psycopg2://postgres:<senha>@aws-1-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
 
 # -----------------------------------------------------
-# Conexão
+# Conexão com o banco
 # -----------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
     if not DB_URL:
-        raise RuntimeError("SUPABASE_DB_URL não definido nos Secrets.")
-    return create_engine(DB_URL, pool_pre_ping=True)
+        raise RuntimeError("SUPABASE_DB_URL não definido nos Secrets/variáveis de ambiente.")
+    eng = create_engine(DB_URL, pool_pre_ping=True)
+    return eng
 
 def init_db():
     eng = get_engine()
     with eng.begin() as conn:
+        # Tabela principal de RNCs (simples para teste)
         conn.exec_driver_sql(\"\"\"
         CREATE TABLE IF NOT EXISTS inspecoes (
             id BIGSERIAL PRIMARY KEY,
@@ -39,75 +41,61 @@ def init_db():
             descricao TEXT,
             status TEXT DEFAULT 'Aberta'
         );
-        \"\"\"
-        )
+        \"\"\")
+        # Tabela de contador (ano -> sequência)
         conn.exec_driver_sql(\"\"\"
         CREATE TABLE IF NOT EXISTS rnc_counters (
             year INT PRIMARY KEY,
             last_seq INT NOT NULL
         );
-        \"\"\"
-        )
+        \"\"\")
 
 # -----------------------------------------------------
-# Numeração transacional (YYYY-XXX) — usando %(y)s
+# Util: próximo número RNC (YYYY-XXX) usando UPSERT
 # -----------------------------------------------------
 def next_rnc_num_tx(conn) -> str:
     y = datetime.now().year
-    seq = conn.exec_driver_sql(
-        \"\"\"
+    # Usa pyformat %(y)s em vez de :y
+    seq = conn.exec_driver_sql(\"\"\"
         INSERT INTO rnc_counters (year, last_seq)
         VALUES (%(y)s, 1)
         ON CONFLICT (year)
         DO UPDATE SET last_seq = rnc_counters.last_seq + 1
         RETURNING last_seq;
-        \"\"\",
-        {\"y\": y}
-    ).scalar_one()
+    \"\"\", {\"y\": y}).scalar_one()
     return f\"{y}-{int(seq):03d}\"
 
 # -----------------------------------------------------
-# CRUD
+# CRUD básico
 # -----------------------------------------------------
 def insert_rnc(emitente: str, data_insp: date, area: str, pep: str, titulo: str, descricao: str) -> str:
     eng = get_engine()
     with eng.begin() as conn:
         rnc_num = next_rnc_num_tx(conn)
-        conn.exec_driver_sql(
-            \"\"\"
+        conn.exec_driver_sql(\"\"\"
             INSERT INTO inspecoes (rnc_num, data, emitente, area, pep, titulo, descricao, status)
             VALUES (%(rnc)s, %(data)s, %(emit)s, %(area)s, %(pep)s, %(tit)s, %(desc)s, 'Aberta');
-            \"\"\",
-            {
-                \"rnc\": rnc_num,
-                \"data\": datetime.combine(data_insp, datetime.min.time()),
-                \"emit\": emitente,
-                \"area\": area,
-                \"pep\": pep,
-                \"tit\": titulo,
-                \"desc\": descricao,
-            }
-        )
+        \"\"\", {
+            \"rnc\": rnc_num,
+            \"data\": datetime.combine(data_insp, datetime.min.time()),
+            \"emit\": emitente, \"area\": area, \"pep\": pep,
+            \"tit\": titulo, \"desc\": descricao
+        })
         return rnc_num
 
 def list_rncs_df() -> pd.DataFrame:
     eng = get_engine()
     with eng.connect() as conn:
-        return pd.read_sql(
-            text(\"SELECT id, rnc_num, data, emitente, area, pep, titulo, descricao, status FROM inspecoes ORDER BY id DESC\"),
-            conn,
-        )
+        df = pd.read_sql(text(\"SELECT id, rnc_num, data, emitente, area, pep, titulo, descricao, status FROM inspecoes ORDER BY id DESC\"), conn)
+    return df
 
 def update_status(rnc_id: int, new_status: str):
     eng = get_engine()
     with eng.begin() as conn:
-        conn.exec_driver_sql(
-            \"UPDATE inspecoes SET status = %(s)s WHERE id = %(i)s\",
-            {\"s\": new_status, \"i\": rnc_id},
-        )
+        conn.exec_driver_sql(\"UPDATE inspecoes SET status = %(s)s WHERE id = %(i)s\", {\"s\": new_status, \"i\": rnc_id})
 
 # -----------------------------------------------------
-# Auth simples
+# Autenticação simples (perfil Qualidade)
 # -----------------------------------------------------
 def is_quality() -> bool:
     return st.session_state.get(\"is_quality\", False)
@@ -200,9 +188,9 @@ elif menu == \"⬇️⬆️ CSV\":
         mime=\"text/csv\"
     )
 
-    # Importar
+    # Importar (gera novo número RNC para cada linha)
     st.subheader(\"Importar CSV\")
-    up = st.file_uploader(\"CSV com colunas (emitente, data, area, pep, titulo, descricao). 'data' pode ser YYYY-MM-DD.\", type=[\"csv\"])
+    up = st.file_uploader(\"CSV com colunas básicas (emitente, data, area, pep, titulo, descricao). A coluna 'data' pode ser YYYY-MM-DD.\", type=[\"csv\"])
     if up and st.button(\"Importar agora\"):
         try:
             imp = pd.read_csv(up).fillna(\"\")
@@ -239,4 +227,4 @@ elif menu == \"⬇️⬆️ CSV\":
 elif menu == \"ℹ️ Status\":
     st.title(\"Status\")
     st.code(f\"DB_URL set? {'yes' if bool(DB_URL) else 'no'}\")
-    st.info(\"Placeholders corrigidos para psycopg2: use `%(nome)s` em vez de `:nome`.\")
+    st.info(\"Este app usa **SQL (Supabase Postgres)** com placeholders pyformat `%(x)s`. O contador `rnc_counters` está ativo e sem risco do erro `:y`.\")
