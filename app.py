@@ -1,5 +1,7 @@
 
 import os
+import re
+import urllib.parse
 from datetime import datetime, date
 
 import streamlit as st
@@ -7,24 +9,128 @@ import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-# ----------------------------
-# Configuração do app
-# ----------------------------
-st.set_page_config(page_title="RNC - SQL (corrigido)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="RNC - SQL (AutoFix URL + pg8000)", page_icon="🛠️", layout="wide")
 
-DB_URL = os.getenv("SUPABASE_DB_URL", "")  # Ex.: postgresql+psycopg2://postgres.<ref>:<senha>@aws-1-sa-east-1.pooler.supabase.com:6543/postgres?sslmode=require
+# Lida com:
+# - SUPABASE_DB_URL "errada": db.<ref>.supabase.co:6543  -> converte p/ pooler
+# - Troca driver para pg8000 (100% Python)
+DB_URL_RAW = os.getenv("SUPABASE_DB_URL", "")
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
 
-# ----------------------------
-# Conexão com o banco
-# ----------------------------
+POOLER_HOST_DEFAULT = "aws-1-sa-east-1.pooler.supabase.com"  # região do seu projeto
+
+def redact_url(url: str) -> str:
+    if not url:
+        return "(vazio)"
+    try:
+        # oculta parte da senha e limita userinfo
+        if "@" in url:
+            userinfo, rest = url.split("@", 1)
+            if ":" in userinfo:
+                u, p = userinfo.split(":", 1)
+                if len(p) > 4:
+                    p = p[:2] + "…"
+                userinfo = f"{u}:{p}"
+            userinfo = userinfo[: min(40, len(userinfo))] + ("…" if len(userinfo) > 40 else "")
+            return f"{userinfo}@{rest}"
+        return url
+    except Exception:
+        return url
+
+def ensure_sslmode(qs: str) -> str:
+    # garante sslmode=require na query string
+    if not qs:
+        return "sslmode=require"
+    kv = urllib.parse.parse_qs(qs, keep_blank_values=True)
+    if "sslmode" not in kv:
+        sep = "&" if qs else ""
+        return qs + f"{sep}sslmode=require"
+    return qs
+
+def build_netloc(userinfo: str, host: str, port: int | None) -> str:
+    if port is not None:
+        return f"{userinfo}@{host}:{port}"
+    return f"{userinfo}@{host}"
+
+def autofix_db_url(db_url: str) -> tuple[str, dict]:
+    """
+    Regras:
+    - Sempre força driver pg8000.
+    - Se host for db.<ref>.supabase.co e porta 6543 => troca para pooler + user postgres.<ref> + porta 6543
+    - Se host já for pooler mas sem porta 6543 => ajusta
+    - Garante sslmode=require
+    """
+    if not db_url:
+        return db_url, {}
+
+    # 1) parse
+    p = urllib.parse.urlparse(db_url)
+
+    # 2) força driver pg8000
+    scheme = p.scheme
+    if scheme.startswith("postgresql+psycopg2"):
+        scheme = "postgresql+pg8000"
+    elif scheme == "postgresql":
+        scheme = "postgresql+pg8000"
+    elif not scheme.startswith("postgresql+pg8000"):
+        scheme = "postgresql+pg8000"
+
+    # 3) extrai userinfo/host/port
+    # netloc = "user:pass@host:port"
+    if "@" not in p.netloc:
+        raise RuntimeError("URL sem user@host:porta. Use a string SQLAlchemy do Supabase.")
+    userinfo, hostport = p.netloc.split("@", 1)
+
+    host = hostport
+    port = None
+    if ":" in hostport:
+        host, port_str = hostport.rsplit(":", 1)
+        try:
+            port = int(port_str)
+        except Exception:
+            port = None
+
+    # 4) detecta ref do projeto a partir do host db.<ref>.supabase.co
+    ref = None
+    m = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
+    if m:
+        ref = m.group(1)
+
+    # 5) regras de correção de host/porta/usuario
+    user = userinfo
+    if ref and port == 6543:
+        # estava usando host "db" com porta do pooler => corrige para o host do pooler
+        host = POOLER_HOST_DEFAULT
+        # usuário recomendado para pooler: postgres.<ref>
+        if not user.startswith("postgres."):
+            user = f"postgres.{ref}"
+    elif host.endswith(".pooler.supabase.com"):
+        # já está no pooler: força porta 6543
+        port = 6543
+
+    # 6) remonta netloc e querystring com sslmode
+    qs = ensure_sslmode(p.query)
+    netloc = build_netloc(user, host, port or 6543)  # porta padrão 6543 para pooler
+    fixed = urllib.parse.urlunparse((
+        scheme,
+        netloc,
+        p.path or "/postgres",
+        p.params,
+        qs,
+        p.fragment,
+    ))
+
+    # 7) connect_args para pg8000 com SSL
+    connect_args = {"ssl": True}
+    return fixed, connect_args
+
 @st.cache_resource(show_spinner=False)
 def get_engine() -> Engine:
-    if not DB_URL:
+    if not DB_URL_RAW:
         raise RuntimeError("SUPABASE_DB_URL não definido nos Secrets.")
-    # Se preferir pg8000, troque manualmente o prefixo abaixo para postgresql+pg8000
-    eng = create_engine(DB_URL, pool_pre_ping=True)
-    return eng
+    fixed_url, connect_args = autofix_db_url(DB_URL_RAW)
+    st.sidebar.info("URL ajustada: " + redact_url(fixed_url))
+    return create_engine(fixed_url, pool_pre_ping=True, connect_args=connect_args)
 
 def init_db():
     eng = get_engine()
@@ -49,9 +155,6 @@ def init_db():
         );
         """)
 
-# ----------------------------
-# Numeração transacional YYYY-XXX
-# ----------------------------
 def next_rnc_num_tx(conn) -> str:
     y = datetime.now().year
     seq = conn.exec_driver_sql(
@@ -66,9 +169,6 @@ def next_rnc_num_tx(conn) -> str:
     ).scalar_one()
     return f"{y}-{int(seq):03d}"
 
-# ----------------------------
-# CRUD básico
-# ----------------------------
 def insert_rnc(emitente: str, data_insp: date, area: str, pep: str, titulo: str, descricao: str) -> str:
     eng = get_engine()
     with eng.begin() as conn:
@@ -106,9 +206,6 @@ def update_status(rnc_id: int, new_status: str):
             {"s": new_status, "i": rnc_id},
         )
 
-# ----------------------------
-# Auth simples (perfil Qualidade)
-# ----------------------------
 def is_quality() -> bool:
     return st.session_state.get("is_quality", False)
 
@@ -126,9 +223,7 @@ def auth_box():
             st.session_state.is_quality = False
             st.info("Saiu do perfil Qualidade.")
 
-# ----------------------------
-# UI
-# ----------------------------
+# ---------------- UI ----------------
 try:
     init_db()
 except Exception as e:
@@ -173,7 +268,7 @@ elif menu == "🔎 Consultar":
     if df.empty:
         st.info("Sem registros.")
     else:
-        st.dataframe(df, width='stretch', height=400)  # substitui use_container_width
+        st.dataframe(df, width='stretch', height=400)
         st.subheader("Alterar status")
         sel = st.selectbox("Escolha o ID", options=df["id"].tolist())
         new_status = st.selectbox("Novo status", ["Aberta", "Em ação", "Encerrada", "Cancelada"])
@@ -186,7 +281,6 @@ elif menu == "🔎 Consultar":
 
 elif menu == "⬇️⬆️ CSV":
     st.title("Importar / Exportar CSV")
-    # Exportar
     try:
         df = list_rncs_df()
     except Exception as e:
@@ -200,13 +294,11 @@ elif menu == "⬇️⬆️ CSV":
         mime="text/csv"
     )
 
-    # Importar
     st.subheader("Importar CSV")
     up = st.file_uploader("CSV com colunas (emitente, data, area, pep, titulo, descricao). 'data' pode ser YYYY-MM-DD.", type=["csv"])
     if up and st.button("Importar agora"):
         try:
             imp = pd.read_csv(up).fillna("")
-            # Normaliza data
             if "data" in imp.columns:
                 try:
                     imp["data"] = pd.to_datetime(imp["data"]).dt.date
@@ -238,5 +330,7 @@ elif menu == "⬇️⬆️ CSV":
 
 elif menu == "ℹ️ Status":
     st.title("Status")
-    st.code(f"DB_URL set? {'yes' if bool(DB_URL) else 'no'}")
-    st.info("Placeholders psycopg2: use `%(nome)s` (sem `:nome`). E 'use_container_width' substituído por `width='stretch'`.")
+    st.code("URL lida (parcial): " + redact_url(DB_URL_RAW))
+    fixed_url, _ = autofix_db_url(DB_URL_RAW or "")
+    st.code("URL usada (parcial): " + redact_url(fixed_url or ""))
+    st.info("Driver: pg8000 (sem binários). SSL ativo. Auto-correção para host/porta do pooler quando necessário.")
