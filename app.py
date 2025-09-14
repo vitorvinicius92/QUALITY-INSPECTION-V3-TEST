@@ -9,53 +9,40 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-# Supabase apenas como Storage e KV (JSON no bucket)
+# Supabase apenas como Storage (JSON + fotos). Nada de SQL / SQLAlchemy.
 try:
     from supabase import create_client
 except Exception:
     create_client = None
 
-BUILD_TAG = "v09.1-storage-only+teste"
+BUILD_TAG = "hotfix-v09-storage-only"
 
 st.set_page_config(page_title=f"RNC — {BUILD_TAG}", page_icon="📝", layout="wide")
 
-# -------- Secrets / Env --------
+# -------- Secrets --------
 SUPABASE_URL    = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
 QUALITY_PASS    = os.getenv("QUALITY_PASS", "qualidade123")
-FORCE_LOCAL     = os.getenv("USE_LOCAL_STORAGE", "0") == "1"  # se "1", força salvar localmente (sem Supabase)
 
 # Caminhos dentro do bucket
 DATA_PATH   = "rnc_app/data.json"
 PEP_PATH    = "rnc_app/peps.json"
 LOGO_PATH   = "rnc_app/logo.bin"
 
-# Armazenamento local (para testes / fallback)
-LOCAL_ROOT = ".rnc_data"
-LOCAL_DATA = os.path.join(LOCAL_ROOT, "data.json")
-LOCAL_PEPS = os.path.join(LOCAL_ROOT, "peps.json")
-LOCAL_LOGO = os.path.join(LOCAL_ROOT, "logo.bin")
-
-def ensure_local_root():
-    os.makedirs(LOCAL_ROOT, exist_ok=True)
-
 # -------- Cliente Supabase --------
 def get_sb():
-    if FORCE_LOCAL:
-        return None
     if not (SUPABASE_URL and SUPABASE_KEY and create_client):
         return None
     try:
-        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
-        return sb
+        return create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception:
         return None
 
 sb = get_sb()
 
 def ensure_bucket():
-    if FORCE_LOCAL or not sb:
+    if not sb: 
         return None
     try:
         sb.storage.create_bucket(SUPABASE_BUCKET, public=True)
@@ -65,59 +52,16 @@ def ensure_bucket():
 
 bucket = ensure_bucket()
 
-# -------- Util: ler/escrever no Storage --------
+# -------- Util: Storage JSON --------
 def storage_download_text(key: str) -> Optional[str]:
-    if FORCE_LOCAL:
-        ensure_local_root()
-        p = LOCAL_DATA if key == DATA_PATH else (LOCAL_PEPS if key == PEP_PATH else (
-            LOCAL_LOGO if key == LOGO_PATH else os.path.join(LOCAL_ROOT, key.replace("/", "_"))
-        ))
-        if os.path.exists(p):
-            try:
-                with open(p, "rb") as f:
-                    b = f.read()
-                try:
-                    return b.decode("utf-8")
-                except:
-                    return None
-            except Exception:
-                return None
-        return None
     if not bucket: return None
     try:
         res = bucket.download(key)
-        if hasattr(res, "decode"):
-            return res.decode("utf-8")
-        return res
-    except Exception:
-        return None
-
-def storage_download_bytes(key: str) -> Optional[bytes]:
-    if FORCE_LOCAL:
-        ensure_local_root()
-        p = LOCAL_DATA if key == DATA_PATH else (LOCAL_PEPS if key == PEP_PATH else LOCAL_LOGO)
-        if os.path.exists(p):
-            with open(p, "rb") as f:
-                return f.read()
-        return None
-    if not bucket: return None
-    try:
-        res = bucket.download(key)
-        return res if isinstance(res, (bytes,bytearray)) else None
+        return res.decode("utf-8") if hasattr(res, "decode") else res
     except Exception:
         return None
 
 def storage_upload_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
-    if FORCE_LOCAL:
-        ensure_local_root()
-        p = LOCAL_DATA if key == DATA_PATH else (LOCAL_PEPS if key == PEP_PATH else LOCAL_LOGO)
-        try:
-            with open(p, "wb") as f:
-                f.write(data)
-            return True
-        except Exception as e:
-            st.error(f"[LOCAL] Falha ao salvar {key}: {e}")
-            return False
     if not bucket: return False
     try:
         bucket.upload(key, data, {"content-type": content_type}, upsert=True)
@@ -126,32 +70,13 @@ def storage_upload_bytes(key: str, data: bytes, content_type: str = "application
         st.error(f"Falha ao subir {key}: {e}")
         return False
 
-def storage_delete(key: str) -> bool:
-    if FORCE_LOCAL:
-        p = LOCAL_DATA if key == DATA_PATH else (LOCAL_PEPS if key == PEP_PATH else LOCAL_LOGO)
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-            return True
-        except Exception:
-            return False
-    if not bucket: return False
-    try:
-        bucket.remove([key])
-        return True
-    except Exception:
-        return False
-
-# -------- JSON helpers --------
 def load_json_list(key: str) -> List[Dict[str, Any]]:
     txt = storage_download_text(key)
     if not txt:
         return []
     try:
         data = json.loads(txt)
-        if isinstance(data, list):
-            return data
-        return []
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -190,15 +115,23 @@ def save_peps(codes: List[str]) -> bool:
         return False
 
 def get_logo() -> Optional[bytes]:
-    return storage_download_bytes(LOGO_PATH)
+    if not bucket: return None
+    try:
+        return bucket.download(LOGO_PATH)
+    except Exception:
+        return None
 
 def set_logo(image_bytes: bytes) -> bool:
     return storage_upload_bytes(LOGO_PATH, image_bytes, "image/png")
 
 def clear_logo() -> bool:
-    return storage_delete(LOGO_PATH)
+    if not bucket: return False
+    try:
+        bucket.remove([LOGO_PATH]); return True
+    except Exception:
+        return False
 
-# -------- Numeração da RNC por ano (MAX + 1) --------
+# -------- Numeração (ano + seq baseado no JSON) --------
 def next_rnc_num(rncs: List[Dict[str, Any]]) -> str:
     y = datetime.now().year
     prefix = f"{y}-"
@@ -206,37 +139,22 @@ def next_rnc_num(rncs: List[Dict[str, Any]]) -> str:
     for r in rncs:
         num = str(r.get("rnc_num",""))
         if num.startswith(prefix):
-            try:
-                seqs.append(int(num.split("-")[1]))
-            except Exception:
-                pass
+            try: seqs.append(int(num.split("-")[1]))
+            except: pass
     nxt = (max(seqs) + 1) if seqs else 1
     return f"{y}-{nxt:03d}"
 
 # -------- Upload de fotos --------
 def upload_photos(files, rnc_num: str, tipo: str):
     out = []
-    if not files:
-        return out
-    if bucket is None and not FORCE_LOCAL:
-        st.warning("Storage não configurado.")
-        return out
+    if not files or not bucket: return out
     for f in files:
         try:
             ext = os.path.splitext(f.name)[1].lower() or ".jpg"
-            if FORCE_LOCAL:
-                folder = os.path.join(LOCAL_ROOT, "fotos", rnc_num, tipo)
-                os.makedirs(folder, exist_ok=True)
-                key = os.path.join(folder, f"{uuid.uuid4().hex}{ext}")
-                data = f.read(); f.seek(0)
-                with open(key, "wb") as fp:
-                    fp.write(data)
-                url = key
-            else:
-                key = f"rnc_app/fotos/{rnc_num}/{tipo}/{uuid.uuid4().hex}{ext}"
-                data = f.read(); f.seek(0)
-                bucket.upload(key, data, {"content-type": f.type or "image/jpeg"}, upsert=True)
-                url = bucket.get_public_url(key)
+            key = f"rnc_app/fotos/{rnc_num}/{tipo}/{uuid.uuid4().hex}{ext}"
+            data = f.read(); f.seek(0)
+            bucket.upload(key, data, {"content-type": f.type or "image/jpeg"}, upsert=True)
+            url = bucket.get_public_url(key)
             out.append({"url": url, "path": key, "filename": f.name, "mimetype": f.type or "image/jpeg", "tipo": tipo})
         except Exception as e:
             st.error(f"Falha ao subir {f.name}: {e}")
@@ -332,8 +250,8 @@ def auth_box():
         if st.button("Remover logo"):
             if clear_logo(): st.warning("Logo removida.")
 
-# -------- UI --------
 auth_box()
+
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV", "ℹ️ Status"])
 
 # ➕ Nova RNC
@@ -367,6 +285,8 @@ if menu == "➕ Nova RNC":
     if submitted:
         if not is_quality():
             st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
+        elif not bucket:
+            st.error("Supabase Storage não configurado.")
         else:
             rncs = load_all_rncs()
             rnc_num = next_rnc_num(rncs)
@@ -507,15 +427,12 @@ elif menu == "🏷️ PEPs":
             reader = csv.reader(_io.StringIO(up.getvalue().decode('utf-8')))
             vals = [row[0] for row in reader if row and str(row[0]).strip()]
         s = set(lst)
-        for v in vals:
-            s.add(v.strip())
+        for v in vals: s.add(v.strip())
         if save_peps(sorted(s)):
             st.success(f"Importados {len(vals)} PEPs.")
-        else:
-            st.error("Falha ao salvar PEPs.")
 
     st.subheader("Adicionar manualmente")
-    many = st.text_area("Um PEP por linha (código — descrição).", height=140)
+    many = st.text_area("Um PEP por linha (código — descrição).", height=120)
     if st.button("Adicionar em lote"):
         s = set(lst)
         for ln in (many or "").splitlines():
@@ -529,66 +446,28 @@ elif menu == "⬇️⬆️ CSV":
     st.title("Importar / Exportar CSV de RNCs")
     rncs = load_all_rncs()
     df = pd.DataFrame(rncs)
-    st.download_button("⬇️ Exportar CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export_v09.csv", mime="text/csv")
+    st.download_button("⬇️ Exportar CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export.csv", mime="text/csv")
 
     st.subheader("Importar CSV de RNCs")
-    up = st.file_uploader("Selecione um CSV (sem 'id', app gera automaticamente).", type=["csv"])
+    up = st.file_uploader("Selecione um CSV (sem 'id').", type=["csv"])
     if up and st.button("Importar agora"):
         try:
             imp = pd.read_csv(up)
         except Exception:
-            up.seek(0)
-            imp = pd.read_csv(up, sep=";")
-        rncs = load_all_rncs()
+            up.seek(0); imp = pd.read_csv(up, sep=";")
         inserted = 0
+        rncs = load_all_rncs()
         for _, r in imp.fillna("").iterrows():
-            num = str(r.get("rnc_num","")).strip()
-            if not num:
-                num = next_rnc_num(rncs)
-            novo = dict(r)
-            novo["id"] = uuid.uuid4().hex
-            novo["rnc_num"] = num
-            rncs.insert(0, novo)
-            inserted += 1
+            num = str(r.get("rnc_num","")).strip() or next_rnc_num(rncs)
+            novo = dict(r); novo["id"] = uuid.uuid4().hex; novo["rnc_num"] = num
+            rncs.insert(0, novo); inserted += 1
         if save_all_rncs(rncs):
             st.success(f"Importação concluída. Inseridos: {inserted}.")
-        else:
-            st.error("Falha ao salvar.")
 
 # ℹ️ Status
 elif menu == "ℹ️ Status":
     st.title("Status do App")
-    ok_remote = (sb is not None) and (bucket is not None)
+    ok = bool(sb) and bool(bucket)
     st.write(f"**Build:** {BUILD_TAG}")
-    st.write("**Modo armazenamento:** " + ("LOCAL (USE_LOCAL_STORAGE=1)" if FORCE_LOCAL else ("Supabase Storage" if ok_remote else "Não configurado")))
-    st.code(f"SUPABASE_URL={'set' if bool(SUPABASE_URL) else 'not set'}; SUPABASE_KEY={'set' if bool(SUPABASE_KEY) else 'not set'}; SUPABASE_BUCKET={SUPABASE_BUCKET}; USE_LOCAL_STORAGE={'1' if FORCE_LOCAL else '0'}")
-
-    st.subheader("🔧 Teste automático do Storage")
-    if st.button("Rodar autoteste agora"):
-        try:
-            rncs = load_all_rncs()
-            rnc_num = f"TEST-{uuid.uuid4().hex[:6]}"
-            novo = {
-                "id": uuid.uuid4().hex,
-                "data": str(datetime.now()),
-                "rnc_num": rnc_num,
-                "emitente": "Teste", "area": "Área X", "pep": "PEP-TESTE", "titulo": "RNC de teste",
-                "responsavel": "", "descricao": "Corpo de teste", "referencias": "",
-                "causador": "Teste", "processo": "Teste", "origem": "Teste",
-                "severidade": "Baixa", "categoria": "Qualidade", "acoes": "",
-                "status": "Aberta",
-                "fotos_abertura": [], "fotos_encerramento": [], "fotos_reabertura": []
-            }
-            rncs.insert(0, novo)
-            assert save_all_rncs(rncs), "Falha ao salvar JSON (passo 1)"
-            rncs2 = load_all_rncs()
-            assert any(x["rnc_num"] == rnc_num for x in rncs2), "Registro não apareceu após salvar (passo 2)"
-            pdf = generate_pdf(novo)
-            assert isinstance(pdf, (bytes, bytearray)) and len(pdf) > 100, "PDF não gerado (passo 3)"
-            rncs3 = [x for x in rncs2 if x["rnc_num"] != rnc_num]
-            assert save_all_rncs(rncs3), "Falha ao limpar item de teste (passo 4)"
-            st.success("✅ Autoteste concluído com sucesso.")
-            st.download_button("Baixar PDF de teste", data=pdf, file_name=f"RNC_{rnc_num}_teste.pdf", mime="application/pdf")
-        except Exception as e:
-            st.error(f"❌ Autoteste falhou: {type(e).__name__}: {e}")
-            st.code(traceback.format_exc())
+    st.write("**Supabase Storage:** " + ("OK" if ok else "NÃO CONFIGURADO"))
+    st.code(f"SUPABASE_URL={'set' if bool(SUPABASE_URL) else 'not set'}; SUPABASE_KEY={'set' if bool(SUPABASE_KEY) else 'not set'}; SUPABASE_BUCKET={SUPABASE_BUCKET}")
