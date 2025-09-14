@@ -1,139 +1,132 @@
-
 import os
-import re
 import urllib.parse
 from datetime import datetime, date
 
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import Engine
 
-st.set_page_config(page_title="RNC - SQL (AutoFix URL + pg8000)", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="RNC - Safe Boot (sem travar deploy)", page_icon="🧯", layout="wide")
 
-# Lida com:
-# - SUPABASE_DB_URL "errada": db.<ref>.supabase.co:6543  -> converte p/ pooler
-# - Troca driver para pg8000 (100% Python)
+# ------------------------------------------------------------------
+# Lê Secrets (SUPABASE_DB_URL, QUALITY_PASS). Não conecta automaticamente.
+# ------------------------------------------------------------------
 DB_URL_RAW = os.getenv("SUPABASE_DB_URL", "")
 QUALITY_PASS = os.getenv("QUALITY_PASS", "qualidade123")
 
-POOLER_HOST_DEFAULT = "aws-1-sa-east-1.pooler.supabase.com"  # região do seu projeto
+# Estado da sessão
+if "connected" not in st.session_state:
+    st.session_state.connected = False
+if "db_url_fixed" not in st.session_state:
+    st.session_state.db_url_fixed = ""
+if "engine" not in st.session_state:
+    st.session_state.engine = None
 
-def redact_url(url: str) -> str:
-    if not url:
+POOLER_HOST_DEFAULT = "aws-1-sa-east-1.pooler.supabase.com"
+
+def redact(u: str) -> str:
+    if not u:
         return "(vazio)"
     try:
-        # oculta parte da senha e limita userinfo
-        if "@" in url:
-            userinfo, rest = url.split("@", 1)
+        if "@" in u:
+            userinfo, rest = u.split("@", 1)
             if ":" in userinfo:
-                u, p = userinfo.split(":", 1)
-                if len(p) > 4:
-                    p = p[:2] + "…"
-                userinfo = f"{u}:{p}"
-            userinfo = userinfo[: min(40, len(userinfo))] + ("…" if len(userinfo) > 40 else "")
+                u_, p_ = userinfo.split(":", 1)
+                if len(p_) > 4:
+                    p_ = p_[:2] + "…"
+                userinfo = f"{u_}:{p_}"
+            userinfo = userinfo[:40] + ("…" if len(userinfo) > 40 else "")
             return f"{userinfo}@{rest}"
-        return url
+        return u
     except Exception:
-        return url
+        return u
+
+def force_pg8000_scheme(p):
+    return "postgresql+pg8000"
 
 def ensure_sslmode(qs: str) -> str:
-    # garante sslmode=require na query string
     if not qs:
-        return "sslmode=require"
-    kv = urllib.parse.parse_qs(qs, keep_blank_values=True)
-    if "sslmode" not in kv:
-        sep = "&" if qs else ""
-        return qs + f"{sep}sslmode=require"
+        return "sslmode=require&connect_timeout=8"
+    parsed = urllib.parse.parse_qs(qs, keep_blank_values=True)
+    if "sslmode" not in parsed:
+        qs += "&sslmode=require"
+    if "connect_timeout" not in parsed:
+        qs += "&connect_timeout=8"
     return qs
 
-def build_netloc(userinfo: str, host: str, port: int | None) -> str:
-    if port is not None:
-        return f"{userinfo}@{host}:{port}"
-    return f"{userinfo}@{host}"
-
-def autofix_db_url(db_url: str) -> tuple[str, dict]:
+def autofix_url(raw: str) -> tuple[str, dict]:
     """
-    Regras:
-    - Sempre força driver pg8000.
-    - Se host for db.<ref>.supabase.co e porta 6543 => troca para pooler + user postgres.<ref> + porta 6543
-    - Se host já for pooler mas sem porta 6543 => ajusta
-    - Garante sslmode=require
+    - Força driver pg8000
+    - Se host for db.<ref>.supabase.co com porta 6543, troca para pooler e ajusta user para postgres.<ref>
+    - Se host já for pooler, força porta 6543
+    - Garante sslmode=require e connect_timeout=8
     """
-    if not db_url:
-        return db_url, {}
+    if not raw:
+        raise RuntimeError("SUPABASE_DB_URL não definido.")
+    p = urllib.parse.urlparse(raw)
 
-    # 1) parse
-    p = urllib.parse.urlparse(db_url)
-
-    # 2) força driver pg8000
-    scheme = p.scheme
-    if scheme.startswith("postgresql+psycopg2"):
-        scheme = "postgresql+pg8000"
-    elif scheme == "postgresql":
-        scheme = "postgresql+pg8000"
-    elif not scheme.startswith("postgresql+pg8000"):
-        scheme = "postgresql+pg8000"
-
-    # 3) extrai userinfo/host/port
-    # netloc = "user:pass@host:port"
+    scheme = force_pg8000_scheme(p)
     if "@" not in p.netloc:
-        raise RuntimeError("URL sem user@host:porta. Use a string SQLAlchemy do Supabase.")
-    userinfo, hostport = p.netloc.split("@", 1)
+        raise RuntimeError("URL inválida (sem user@host). Use a string SQLAlchemy do Supabase.")
 
+    userinfo, hostport = p.netloc.split("@", 1)
     host = hostport
     port = None
     if ":" in hostport:
-        host, port_str = hostport.rsplit(":", 1)
+        host, port_s = hostport.rsplit(":", 1)
         try:
-            port = int(port_str)
+            port = int(port_s)
         except Exception:
             port = None
 
-    # 4) detecta ref do projeto a partir do host db.<ref>.supabase.co
+    # Detecta ref do projeto
     ref = None
-    m = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
-    if m:
-        ref = m.group(1)
+    if host.startswith("db.") and host.endswith(".supabase.co"):
+        parts = host.split(".")
+        if len(parts) >= 3:
+            ref = parts[1]
 
-    # 5) regras de correção de host/porta/usuario
-    user = userinfo
-    if ref and port == 6543:
-        # estava usando host "db" com porta do pooler => corrige para o host do pooler
-        host = POOLER_HOST_DEFAULT
-        # usuário recomendado para pooler: postgres.<ref>
-        if not user.startswith("postgres."):
-            user = f"postgres.{ref}"
-    elif host.endswith(".pooler.supabase.com"):
-        # já está no pooler: força porta 6543
+    # Corrige pooler/porta
+    if host.endswith(".pooler.supabase.com"):
         port = 6543
+    elif ref and port == 6543:
+        host = POOLER_HOST_DEFAULT
+        if not userinfo.startswith("postgres."):
+            # preserva senha após os dois pontos
+            if ":" in userinfo:
+                _, password = userinfo.split(":", 1)
+                userinfo = f"postgres.{ref}:{password}"
+            else:
+                userinfo = f"postgres.{ref}"
 
-    # 6) remonta netloc e querystring com sslmode
+    if host.startswith("db.") and host.endswith(".supabase.co") and (port is None):
+        port = 5432
+
     qs = ensure_sslmode(p.query)
-    netloc = build_netloc(user, host, port or 6543)  # porta padrão 6543 para pooler
     fixed = urllib.parse.urlunparse((
         scheme,
-        netloc,
+        f"{userinfo}@{host}:{port or 5432}",
         p.path or "/postgres",
         p.params,
         qs,
         p.fragment,
     ))
-
-    # 7) connect_args para pg8000 com SSL
-    connect_args = {"ssl": True}
+    connect_args = {"ssl": True, "timeout": 8}
     return fixed, connect_args
 
-@st.cache_resource(show_spinner=False)
-def get_engine() -> Engine:
-    if not DB_URL_RAW:
-        raise RuntimeError("SUPABASE_DB_URL não definido nos Secrets.")
-    fixed_url, connect_args = autofix_db_url(DB_URL_RAW)
-    st.sidebar.info("URL ajustada: " + redact_url(fixed_url))
-    return create_engine(fixed_url, pool_pre_ping=True, connect_args=connect_args)
+def try_connect():
+    url, connect_args = autofix_url(DB_URL_RAW)
+    st.session_state.db_url_fixed = url
+    eng = create_engine(url, pool_size=1, max_overflow=0, pool_pre_ping=False, connect_args=connect_args)
+    with eng.connect() as conn:
+        conn.exec_driver_sql("SELECT 1;")
+    st.session_state.engine = eng
+    st.session_state.connected = True
 
-def init_db():
-    eng = get_engine()
+def init_db_if_needed():
+    eng = st.session_state.engine
+    if not eng:
+        return
     with eng.begin() as conn:
         conn.exec_driver_sql("""
         CREATE TABLE IF NOT EXISTS inspecoes (
@@ -170,7 +163,7 @@ def next_rnc_num_tx(conn) -> str:
     return f"{y}-{int(seq):03d}"
 
 def insert_rnc(emitente: str, data_insp: date, area: str, pep: str, titulo: str, descricao: str) -> str:
-    eng = get_engine()
+    eng = st.session_state.engine
     with eng.begin() as conn:
         rnc_num = next_rnc_num_tx(conn)
         conn.exec_driver_sql(
@@ -191,7 +184,7 @@ def insert_rnc(emitente: str, data_insp: date, area: str, pep: str, titulo: str,
         return rnc_num
 
 def list_rncs_df() -> pd.DataFrame:
-    eng = get_engine()
+    eng = st.session_state.engine
     with eng.connect() as conn:
         return pd.read_sql(
             text("SELECT id, rnc_num, data, emitente, area, pep, titulo, descricao, status FROM inspecoes ORDER BY id DESC"),
@@ -199,40 +192,36 @@ def list_rncs_df() -> pd.DataFrame:
         )
 
 def update_status(rnc_id: int, new_status: str):
-    eng = get_engine()
+    eng = st.session_state.engine
     with eng.begin() as conn:
         conn.exec_driver_sql(
             "UPDATE inspecoes SET status = %(s)s WHERE id = %(i)s",
             {"s": new_status, "i": rnc_id},
         )
 
-def is_quality() -> bool:
-    return st.session_state.get("is_quality", False)
-
-def auth_box():
-    with st.sidebar.expander("🔐 Acesso Qualidade"):
-        pwd = st.text_input("Senha (QUALITY_PASS)", type="password")
-        c1, c2 = st.columns(2)
-        if c1.button("Entrar"):
-            if pwd == QUALITY_PASS:
-                st.session_state.is_quality = True
-                st.success("Perfil Qualidade ativo.")
-            else:
-                st.error("Senha incorreta.")
-        if c2.button("Sair"):
-            st.session_state.is_quality = False
-            st.info("Saiu do perfil Qualidade.")
-
 # ---------------- UI ----------------
-try:
-    init_db()
-except Exception as e:
-    st.error(f"Falha ao inicializar o banco: {e}")
-    st.stop()
+st.sidebar.subheader("Conexão com Banco (Safe Boot)")
+st.sidebar.code("Lida (parcial): " + redact(DB_URL_RAW))
+if st.session_state.db_url_fixed:
+    st.sidebar.code("Usada (parcial): " + redact(st.session_state.db_url_fixed))
+btn = st.sidebar.button("🔌 Conectar", type="primary", disabled=st.session_state.connected)
 
-auth_box()
+if btn and not st.session_state.connected:
+    with st.status("Conectando ao banco...", expanded=True) as s:
+        try:
+            try_connect()
+            init_db_if_needed()
+            s.update(label="✅ Conectado!", state="complete")
+            st.sidebar.success("Conectado com sucesso.")
+        except Exception as e:
+            s.update(label="❌ Falha na conexão", state="error")
+            st.sidebar.error(f"Erro: {e}")
 
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar", "⬇️⬆️ CSV", "ℹ️ Status"])
+
+if not st.session_state.connected:
+    st.info("Clique em **🔌 Conectar** na barra lateral para iniciar a conexão (timeout curto para não travar).");
+    st.stop()
 
 if menu == "➕ Nova RNC":
     st.title("Nova RNC (SQL)")
@@ -248,14 +237,11 @@ if menu == "➕ Nova RNC":
         submitted = st.form_submit_button("Salvar RNC")
 
     if submitted:
-        if not is_quality():
-            st.error("Somente Qualidade pode salvar. Faça login na barra lateral.")
-        else:
-            try:
-                rnc_num = insert_rnc(emitente, data_insp, area, pep, titulo, descricao)
-                st.success(f"RNC salva! Nº {rnc_num}")
-            except Exception as e:
-                st.error(f"Erro ao salvar: {e}")
+        try:
+            rnc_num = insert_rnc(emitente, data_insp, area, pep, titulo, descricao)
+            st.success(f"RNC salva! Nº {rnc_num}")
+        except Exception as e:
+            st.error(f"Erro ao salvar: {e}")
 
 elif menu == "🔎 Consultar":
     st.title("Consultar RNCs")
@@ -330,7 +316,12 @@ elif menu == "⬇️⬆️ CSV":
 
 elif menu == "ℹ️ Status":
     st.title("Status")
-    st.code("URL lida (parcial): " + redact_url(DB_URL_RAW))
-    fixed_url, _ = autofix_db_url(DB_URL_RAW or "")
-    st.code("URL usada (parcial): " + redact_url(fixed_url or ""))
-    st.info("Driver: pg8000 (sem binários). SSL ativo. Auto-correção para host/porta do pooler quando necessário.")
+    try:
+        import pg8000
+        st.success(f"pg8000 importado: v{pg8000.__version__}")
+    except Exception as e:
+        st.error("pg8000 NÃO está instalado.")
+        st.exception(e)
+    st.code("SUPABASE_DB_URL (parcial): " + redact(DB_URL_RAW))
+    st.code("URL usada (parcial): " + redact(st.session_state.db_url_fixed))
+    st.info("Modo Safe Boot: conexão só quando você clicar em 'Conectar', com timeout curto (8s).")
