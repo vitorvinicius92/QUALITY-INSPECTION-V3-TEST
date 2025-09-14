@@ -9,13 +9,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 
-# Supabase apenas como Storage (JSON + fotos). Nada de SQL / SQLAlchemy.
+# -------- Supabase (apenas Storage) --------
 try:
     from supabase import create_client
 except Exception:
     create_client = None
 
-BUILD_TAG = "hotfix-v09-storage-only"
+BUILD_TAG = "v10-storage-only"
 
 st.set_page_config(page_title=f"RNC — {BUILD_TAG}", page_icon="📝", layout="wide")
 
@@ -25,34 +25,28 @@ SUPABASE_KEY    = os.getenv("SUPABASE_KEY", "")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "RNC-FOTOS")
 QUALITY_PASS    = os.getenv("QUALITY_PASS", "qualidade123")
 
-# Caminhos dentro do bucket
-DATA_PATH   = "rnc_app/data.json"
-PEP_PATH    = "rnc_app/peps.json"
-LOGO_PATH   = "rnc_app/logo.bin"
+# -------- Caminhos no bucket --------
+DATA_PATH   = "rnc_app/data.json"   # lista de RNCs
+PEP_PATH    = "rnc_app/peps.json"   # lista de PEPs (lista simples de strings)
+LOGO_PATH   = "rnc_app/logo.bin"    # imagem da logo para PDF
 
-# -------- Cliente Supabase --------
-def get_sb():
+# -------- Cliente Supabase + bucket --------
+def get_bucket():
     if not (SUPABASE_URL and SUPABASE_KEY and create_client):
         return None
     try:
-        return create_client(SUPABASE_URL, SUPABASE_KEY)
+        sb = create_client(SUPABASE_URL, SUPABASE_KEY)
+        try:
+            sb.storage.create_bucket(SUPABASE_BUCKET, public=True)
+        except Exception:
+            pass
+        return sb.storage.from_(SUPABASE_BUCKET)
     except Exception:
         return None
 
-sb = get_sb()
+bucket = get_bucket()
 
-def ensure_bucket():
-    if not sb: 
-        return None
-    try:
-        sb.storage.create_bucket(SUPABASE_BUCKET, public=True)
-    except Exception:
-        pass
-    return sb.storage.from_(SUPABASE_BUCKET)
-
-bucket = ensure_bucket()
-
-# -------- Util: Storage JSON --------
+# -------- Helpers Storage --------
 def storage_download_text(key: str) -> Optional[str]:
     if not bucket: return None
     try:
@@ -61,7 +55,15 @@ def storage_download_text(key: str) -> Optional[str]:
     except Exception:
         return None
 
-def storage_upload_bytes(key: str, data: bytes, content_type: str = "application/octet-stream") -> bool:
+def storage_download_bytes(key: str) -> Optional[bytes]:
+    if not bucket: return None
+    try:
+        res = bucket.download(key)
+        return res if isinstance(res, (bytes, bytearray)) else None
+    except Exception:
+        return None
+
+def storage_upload_bytes(key: str, data: bytes, content_type: str) -> bool:
     if not bucket: return False
     try:
         bucket.upload(key, data, {"content-type": content_type}, upsert=True)
@@ -70,10 +72,17 @@ def storage_upload_bytes(key: str, data: bytes, content_type: str = "application
         st.error(f"Falha ao subir {key}: {e}")
         return False
 
+def storage_delete(key: str) -> bool:
+    if not bucket: return False
+    try:
+        bucket.remove([key]); return True
+    except Exception:
+        return False
+
+# -------- JSON helpers --------
 def load_json_list(key: str) -> List[Dict[str, Any]]:
     txt = storage_download_text(key)
-    if not txt:
-        return []
+    if not txt: return []
     try:
         data = json.loads(txt)
         return data if isinstance(data, list) else []
@@ -84,8 +93,7 @@ def save_json_list(key: str, data: List[Dict[str, Any]]) -> bool:
     try:
         raw = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         return storage_upload_bytes(key, raw, "application/json")
-    except Exception as e:
-        st.error(f"Falha ao salvar JSON: {e}")
+    except Exception:
         return False
 
 # -------- Dados principais --------
@@ -97,8 +105,7 @@ def save_all_rncs(lst: List[Dict[str, Any]]) -> bool:
 
 def load_peps() -> List[str]:
     txt = storage_download_text(PEP_PATH)
-    if not txt:
-        return []
+    if not txt: return []
     try:
         data = json.loads(txt)
         if isinstance(data, list):
@@ -115,23 +122,15 @@ def save_peps(codes: List[str]) -> bool:
         return False
 
 def get_logo() -> Optional[bytes]:
-    if not bucket: return None
-    try:
-        return bucket.download(LOGO_PATH)
-    except Exception:
-        return None
+    return storage_download_bytes(LOGO_PATH)
 
 def set_logo(image_bytes: bytes) -> bool:
     return storage_upload_bytes(LOGO_PATH, image_bytes, "image/png")
 
 def clear_logo() -> bool:
-    if not bucket: return False
-    try:
-        bucket.remove([LOGO_PATH]); return True
-    except Exception:
-        return False
+    return storage_delete(LOGO_PATH)
 
-# -------- Numeração (ano + seq baseado no JSON) --------
+# -------- Numeração (ano + seq do JSON) --------
 def next_rnc_num(rncs: List[Dict[str, Any]]) -> str:
     y = datetime.now().year
     prefix = f"{y}-"
@@ -147,7 +146,10 @@ def next_rnc_num(rncs: List[Dict[str, Any]]) -> str:
 # -------- Upload de fotos --------
 def upload_photos(files, rnc_num: str, tipo: str):
     out = []
-    if not files or not bucket: return out
+    if not files: return out
+    if not bucket:
+        st.error("Supabase Storage não configurado.")
+        return out
     for f in files:
         try:
             ext = os.path.splitext(f.name)[1].lower() or ".jpg"
@@ -252,6 +254,7 @@ def auth_box():
 
 auth_box()
 
+# -------- UI --------
 menu = st.sidebar.radio("Menu", ["➕ Nova RNC", "🔎 Consultar/Editar", "🏷️ PEPs", "⬇️⬆️ CSV", "ℹ️ Status"])
 
 # ➕ Nova RNC
@@ -363,7 +366,7 @@ elif menu == "🔎 Consultar/Editar":
                     r["encerramento_desc"] = encerr_desc
                     r["eficacia"] = eficacia
                     r["fotos_encerramento"] = (r.get("fotos_encerramento") or []) + upload_photos(fotos_enc or [], r["rnc_num"], "encerramento")
-                    save_all_rncs(rncs); st.success("RNC encerrada.")
+                    if save_all_rncs(rncs): st.success("RNC encerrada.")
 
             with st.expander("♻️ Reabrir RNC"):
                 reab_por = st.text_input("Reaberta por", key=f"repor_{r['id']}")
@@ -377,7 +380,7 @@ elif menu == "🔎 Consultar/Editar":
                     r["reabertura_motivo"] = reab_motivo
                     r["reabertura_desc"] = reab_desc
                     r["fotos_reabertura"] = (r.get("fotos_reabertura") or []) + upload_photos(fotos_rea or [], r["rnc_num"], "reabertura")
-                    save_all_rncs(rncs); st.success("RNC reaberta.")
+                    if save_all_rncs(rncs): st.success("RNC reaberta.")
 
             with st.expander("🚫 Cancelar RNC"):
                 c_por = st.text_input("Cancelada por", key=f"canpor_{r['id']}")
@@ -387,14 +390,14 @@ elif menu == "🔎 Consultar/Editar":
                     r["cancelada_em"] = str(datetime.now())
                     r["cancelada_por"] = c_por
                     r["cancelamento_motivo"] = c_mot
-                    save_all_rncs(rncs); st.success("RNC cancelada.")
+                    if save_all_rncs(rncs): st.success("RNC cancelada.")
 
             with st.expander("🗑️ Excluir permanentemente"):
                 conf = st.text_input("Digite CONFIRMAR para excluir", key=f"del_{r['id']}")
                 if st.button("Excluir RNC", key=f"delok_{r['id']}"):
                     if conf.strip().upper() == "CONFIRMAR":
                         rncs = [x for x in rncs if x["id"] != r["id"]]
-                        save_all_rncs(rncs); st.success("RNC excluída.")
+                        if save_all_rncs(rncs): st.success("RNC excluída.")
                     else:
                         st.warning("Digite CONFIRMAR exatamente.")
         else:
@@ -446,10 +449,10 @@ elif menu == "⬇️⬆️ CSV":
     st.title("Importar / Exportar CSV de RNCs")
     rncs = load_all_rncs()
     df = pd.DataFrame(rncs)
-    st.download_button("⬇️ Exportar CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export.csv", mime="text/csv")
+    st.download_button("⬇️ Exportar CSV", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="rnc_export_v10.csv", mime="text/csv")
 
     st.subheader("Importar CSV de RNCs")
-    up = st.file_uploader("Selecione um CSV (sem 'id').", type=["csv"])
+    up = st.file_uploader("Selecione um CSV (sem 'id', app gera).", type=["csv"])
     if up and st.button("Importar agora"):
         try:
             imp = pd.read_csv(up)
@@ -467,7 +470,7 @@ elif menu == "⬇️⬆️ CSV":
 # ℹ️ Status
 elif menu == "ℹ️ Status":
     st.title("Status do App")
-    ok = bool(sb) and bool(bucket)
+    ok = bool(bucket)
     st.write(f"**Build:** {BUILD_TAG}")
     st.write("**Supabase Storage:** " + ("OK" if ok else "NÃO CONFIGURADO"))
     st.code(f"SUPABASE_URL={'set' if bool(SUPABASE_URL) else 'not set'}; SUPABASE_KEY={'set' if bool(SUPABASE_KEY) else 'not set'}; SUPABASE_BUCKET={SUPABASE_BUCKET}")
